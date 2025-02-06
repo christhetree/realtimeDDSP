@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
 import torch
-from torch import Tensor
+from torch import Tensor as T, nn
 
 from diffsynth.model import EstimatorSynth
 from diffsynth.modules.generators import FilteredNoise, Harmonic
@@ -137,10 +137,10 @@ class DDSPModelWrapper(WaveformToWaveformBase):
         ]
 
     def is_input_mono(self) -> bool:
-        return True
+        return False
 
     def is_output_mono(self) -> bool:
-        return True
+        return False
 
     def get_native_sample_rates(self) -> List[int]:
         return [44100]
@@ -157,7 +157,7 @@ class DDSPModelWrapper(WaveformToWaveformBase):
         Engel, J., Hantrakul, L., Gu, C., & Roberts, A. (2020). DDSP:Differentiable Digital Signal Processing. ICLR.
         """
 
-    def do_forward_pass(self, x: Tensor, params: Dict[str, torch.Tensor]) -> Tensor:
+    def do_forward_pass(self, x: T, params: Dict[str, T]) -> T:
         with torch.no_grad():
             # pitch shift parameter
             MAX_SHIFT = 24  # semitones
@@ -169,9 +169,26 @@ class DDSPModelWrapper(WaveformToWaveformBase):
             noise_mix = params["Noise Mix"] * 2  # 0(no noise)~2
             rev_mix = params["Reverb Mix"]  # 0(no reverb)~1(reverb only)
             cond_params = {"harmmix": harm_mix, "noisemix": noise_mix, "irmix": rev_mix}
-            out1 = self.model(x, f0_mult=f0_mult, param=cond_params)
-            out2 = self.model(x, f0_mult=f0_mult, param=cond_params)
-            out = (out1 + out2) / 2
+            out = self.model(x, f0_mult=f0_mult, param=cond_params)
+        return out
+
+
+class LRModel(nn.Module):
+    def __init__(
+        self,
+        model_l: CachedStreamEstimatorFLSynth,
+        model_r: CachedStreamEstimatorFLSynth,
+    ):
+        super().__init__()
+        self.model_l = model_l
+        self.model_r = model_r
+
+    def forward(self, x: T, f0_mult: T, param: Dict[str, T]) -> T:
+        x_l = x[:1, :]
+        out_l = self.model_l(x_l, f0_mult=f0_mult, param=param)
+        x_r = x[1:, :]
+        out_r = self.model_r(x_r, f0_mult=f0_mult, param=param)
+        out = torch.cat([out_l, out_r], dim=0)
         return out
 
 
@@ -210,19 +227,36 @@ def prepare_model(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('ckpt',             type=str,   help='')
-    parser.add_argument('output',           type=str,   help='model output name')
-    parser.add_argument('--folder',   default='./exports', help='output folder')
-    parser.add_argument('--sounds',   nargs='*', type=str, default=None, help='directory of sounds to use as example input.')
+    # parser.add_argument('ckpt', type=str, help='')
+    parser.add_argument(
+        "ckpt_left", type=str, help="model checkpoint path for the left channel"
+    )
+    parser.add_argument(
+        "ckpt_right", type=str, help="model checkpoint path for the right channel"
+    )
+    parser.add_argument("output", type=str, help="model output name")
+    parser.add_argument("--folder", default="./exports", help="output folder")
+    parser.add_argument(
+        "--sounds",
+        nargs="*",
+        type=str,
+        default=None,
+        help="directory of sounds to use as example input.",
+    )
     args = parser.parse_args()
 
     # class Args(NamedTuple):
-    #     ckpt: str
+    #     # ckpt: str
+    #     ckpt_left: str
+    #     ckpt_right: str
     #     output: str
     #     folder: str
     #     sounds: Optional[str] = None
+    #
     # args = Args(
-    #     ckpt="ckpts/epoch=288-step=100000.ckpt",
+    #     # ckpt="ckpts/epoch=288-step=100000.ckpt",
+    #     ckpt_left="ckpts/epoch=288-step=100000.ckpt",
+    #     ckpt_right="ckpts/epoch=288-step=100000.ckpt",
     #     output="ddsp2",
     #     folder="./exports",
     #     sounds=None,
@@ -230,9 +264,13 @@ if __name__ == "__main__":
 
     root_dir = Path(args.folder) / args.output
 
-    stream_model = prepare_model(
-        args.ckpt, sample_rate=44100, hop_size=512, ir_zero_tail_n=9600
+    stream_model_l = prepare_model(
+        args.ckpt_left, sample_rate=44100, hop_size=512, ir_zero_tail_n=9600
     )
+    stream_model_r = prepare_model(
+        args.ckpt_right, sample_rate=44100, hop_size=512, ir_zero_tail_n=9600
+    )
+    stream_model = LRModel(stream_model_l, stream_model_r)
     wrapper = DDSPModelWrapper(stream_model)
 
     soundpairs = []
