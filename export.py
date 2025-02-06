@@ -1,6 +1,6 @@
 import os, logging, argparse
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, NamedTuple, Optional
 
 import torch
 from torch import Tensor
@@ -26,6 +26,7 @@ logging.basicConfig()
 log = logging.getLogger(__name__)
 log.setLevel(level=os.environ.get("LOGLEVEL", "INFO"))
 
+
 def get_stream_synth(synth):
     new_ps = []
     new_cs = []
@@ -33,28 +34,38 @@ def get_stream_synth(synth):
     for proc, conn in zip(synth.processors, synth.connections):
         if isinstance(proc, Harmonic):
             # Replace with streamable version of harmonic synthesizer
-            new_ps.append(StreamHarmonic(proc.sample_rate, proc.normalize_below_nyquist, proc.name, proc.n_harmonics, proc.freq_range))
+            new_ps.append(
+                StreamHarmonic(
+                    proc.sample_rate,
+                    proc.normalize_below_nyquist,
+                    proc.name,
+                    proc.n_harmonics,
+                    proc.freq_range,
+                )
+            )
             new_cs.append(conn)
         elif isinstance(proc, FilteredNoise):
             # Replace with streamable version of noise synthesizer
-            new_ps.append(StreamFilteredNoise(proc.filter_size, proc.name, proc.amplitude))
+            new_ps.append(
+                StreamFilteredNoise(proc.filter_size, proc.name, proc.amplitude)
+            )
             new_cs.append(conn)
         elif isinstance(proc, IRReverb):
             # Replace with streamable version of ir reverb
             new_ps.append(StreamIRReverb(proc.ir, proc.name))
             conn_mix = dict(conn)
             # this version has a parameter for adjusting reverb mix
-            conn_mix['mix'] = 'irmix'
+            conn_mix["mix"] = "irmix"
             new_cs.append(conn_mix)
-            conditioned.append('irmix')
-        elif proc.name == 'add':
+            conditioned.append("irmix")
+        elif proc.name == "add":
             # Replace add module with mix module for adjusting harm/noise
             new_ps.append(Mix(proc.name))
             conn_mix = dict(conn)
-            conn_mix['mix_a'] = 'harmmix'
-            conn_mix['mix_b'] = 'noisemix'
+            conn_mix["mix_a"] = "harmmix"
+            conn_mix["mix_b"] = "noisemix"
             new_cs.append(conn_mix)
-            conditioned.extend(['harmmix', 'noisemix'])
+            conditioned.extend(["harmmix", "noisemix"])
         else:
             new_ps.append(proc)
             new_cs.append(conn)
@@ -64,7 +75,9 @@ def get_stream_synth(synth):
     new_synth = Synthesizer(dag, conditioned=conditioned)
     return new_synth
 
+
 BUF_SIZE = 2048
+
 
 class DDSPModelWrapper(WaveformToWaveformBase):
     def get_model_name(self) -> str:
@@ -103,11 +116,26 @@ class DDSPModelWrapper(WaveformToWaveformBase):
 
     def get_neutone_parameters(self) -> List[NeutoneParameter]:
         return [
-            NeutoneParameter(name='Pitch Shift', description='Apply pitch shift (-24 to +24 semitones)', default_value=0.5),
-            NeutoneParameter(name='Harmonics Mix', description='Mix of harmonic synthesizer', default_value=0.5),
-            NeutoneParameter(name='Noise Mix', description='Mix of noise synthesizer', default_value=0.5),
-            NeutoneParameter(name='Reverb Mix', description='Mix of IR reverb', default_value=0.5),
-            ]
+            NeutoneParameter(
+                name="Pitch Shift",
+                description="Apply pitch shift (-24 to +24 semitones)",
+                default_value=0.5,
+            ),
+            NeutoneParameter(
+                name="Harmonics Mix",
+                description="Mix of harmonic synthesizer",
+                default_value=0.5,
+            ),
+            NeutoneParameter(
+                name="Noise Mix",
+                description="Mix of noise synthesizer",
+                default_value=0.5,
+            ),
+            NeutoneParameter(
+                name="Reverb Mix", description="Mix of IR reverb", default_value=0.5
+            ),
+        ]
+
     def is_input_mono(self) -> bool:
         return True
 
@@ -115,7 +143,7 @@ class DDSPModelWrapper(WaveformToWaveformBase):
         return True
 
     def get_native_sample_rates(self) -> List[int]:
-        return [48000]
+        return [44100]
 
     def get_native_buffer_sizes(self) -> List[int]:
         return [2048]  # BUF_SIZE
@@ -129,13 +157,8 @@ class DDSPModelWrapper(WaveformToWaveformBase):
         Engel, J., Hantrakul, L., Gu, C., & Roberts, A. (2020). DDSP:Differentiable Digital Signal Processing. ICLR.
         """
 
-    def do_forward_pass(
-        self, x: Tensor,
-        params: Dict[str, torch.Tensor]
-    ) -> Tensor:
+    def do_forward_pass(self, x: Tensor, params: Dict[str, torch.Tensor]) -> Tensor:
         with torch.no_grad():
-            if x.size(0) == 2:
-                x = x.mean(dim=0, keepdim=True)
             # pitch shift parameter
             MAX_SHIFT = 24  # semitones
             pshift = (params["Pitch Shift"] - 0.5) * 2 * MAX_SHIFT  # -24~24
@@ -146,8 +169,44 @@ class DDSPModelWrapper(WaveformToWaveformBase):
             noise_mix = params["Noise Mix"] * 2  # 0(no noise)~2
             rev_mix = params["Reverb Mix"]  # 0(no reverb)~1(reverb only)
             cond_params = {"harmmix": harm_mix, "noisemix": noise_mix, "irmix": rev_mix}
-            out = self.model(x, f0_mult=f0_mult, param=cond_params)
+            out1 = self.model(x, f0_mult=f0_mult, param=cond_params)
+            out2 = self.model(x, f0_mult=f0_mult, param=cond_params)
+            out = (out1 + out2) / 2
         return out
+
+
+def prepare_model(
+    ckpt_path: str, sample_rate: int, hop_size: int, ir_zero_tail_n: int = 0
+) -> CachedStreamEstimatorFLSynth:
+    model = EstimatorSynth.load_from_checkpoint(
+        ckpt_path, strict=False, map_location="cpu"
+    ).eval()
+    replace_modules(model.estimator)
+    # get streamable hpnir synth with mix parameters
+    model.synth = get_stream_synth(model.synth)
+
+    # Get rid of delay in IR if applicable
+    ir = model.synth.processors[-1].ir
+    assert ir.ndim == 2
+    assert ir.size(1) >= ir_zero_tail_n
+    if ir_zero_tail_n > 0:
+        ir[:, -ir_zero_tail_n:] = 0.0
+
+    stream_model = CachedStreamEstimatorFLSynth(
+        model.estimator, model.synth, sample_rate=sample_rate, hop_size=hop_size
+    )
+    dummy = torch.zeros(1, BUF_SIZE)
+    _ = stream_model(
+        dummy,
+        torch.ones(1),
+        {
+            "harmmix": torch.ones(1),
+            "noisemix": torch.ones(1),
+            "irmix": torch.ones(1) * 0.5,
+        },
+    )
+    return stream_model
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -156,19 +215,24 @@ if __name__ == "__main__":
     parser.add_argument('--folder',   default='./exports', help='output folder')
     parser.add_argument('--sounds',   nargs='*', type=str, default=None, help='directory of sounds to use as example input.')
     args = parser.parse_args()
+
+    # class Args(NamedTuple):
+    #     ckpt: str
+    #     output: str
+    #     folder: str
+    #     sounds: Optional[str] = None
+    # args = Args(
+    #     ckpt="ckpts/epoch=288-step=100000.ckpt",
+    #     output="ddsp2",
+    #     folder="./exports",
+    #     sounds=None,
+    # )
+
     root_dir = Path(args.folder) / args.output
 
-    model = EstimatorSynth.load_from_checkpoint(
-        args.ckpt, strict=False, map_location="cpu"
-    ).eval()
-    replace_modules(model.estimator)
-    # get streamable hpnir synth with mix parameters
-    model.synth = get_stream_synth(model.synth)
-    stream_model = CachedStreamEstimatorFLSynth(
-        model.estimator, model.synth, 48000, hop_size=512
+    stream_model = prepare_model(
+        args.ckpt, sample_rate=44100, hop_size=512, ir_zero_tail_n=9600
     )
-    dummy = torch.zeros(1, BUF_SIZE)
-    _ = stream_model(dummy, torch.ones(1), {'harmmix': torch.ones(1), 'noisemix': torch.ones(1), 'irmix': torch.ones(1)*0.5})
     wrapper = DDSPModelWrapper(stream_model)
 
     soundpairs = []
@@ -183,5 +247,11 @@ if __name__ == "__main__":
         soundpairs.append(AudioSamplePair(input_sample, rendered_sample))
 
     save_neutone_model(
-        wrapper, root_dir, freeze=False, dump_samples=True, submission=True, audio_sample_pairs=soundpairs
+        wrapper,
+        root_dir,
+        dump_samples=True,
+        # dump_samples=False,
+        submission=True,
+        # submission=False,
+        audio_sample_pairs=soundpairs,
     )
